@@ -7,3 +7,4 @@ jobs:
       - checkout
       - run: dotnet restore src/InfinityLabs.DQueue.Core/InfinityLabs.DQueue.Core.csproj
       - run: dotnet build src/InfinityLabs.DQueue.Core/InfinityLabs.DQueue.Core.csproj
+      - run: dotnet test test/InfinityLabs.DQueue.Core.Tests/InfinityLabs.DQueue.Core.Tests.csproj

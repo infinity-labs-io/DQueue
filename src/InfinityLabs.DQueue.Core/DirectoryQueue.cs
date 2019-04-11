@@ -3,145 +3,154 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
+using Timer = System.Timers.Timer;
 
 namespace InfinityLabs.DQueue.Core
 {
-    public class DirectoryQueue<TObject> : IDisposable
+    public class DirectoryQueue<TObject>
+        where TObject : class
     {
-        private const string QUEUE_KEY = "2E07BE5FD50C42B0AE53F2489D7FD9B4";
+        private const string ITEM_EXTENSION = ".dqi";
+        private const string QUEUE_KEY = "DQ_2E07BE5FD50C42B0AE53F2489D7FD9B4";
         private readonly string _queuePath;
-        private readonly string _lockPath;
-        private readonly int _waitTime;
+        private readonly int _timeToWait;
+        private readonly bool _lazyInitialize;
+        private readonly DirectoryInfo _queueDirectory;
 
-        private IDisposable _queueLock;
-
-        private bool _initialized;
-
-        private DirectoryInfo _directoryInfo;
-
-        private Queue<DirectoryQueueItem<TObject>> _readQueue;
-
-        public int Count => _readQueue.Count;
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="key"></param>
-        /// <param name="waitTime"></param>
-        /// <exception cref="TimeoutException">Occurs when a another process is working with the queue.</exception>
-        public DirectoryQueue(string key, int waitTime = 10000)
+        public int Count
         {
-            _waitTime = waitTime;
+            get
+            {
+                using(lockQueue())
+                {
+                    return _queueDirectory
+                        .EnumerateFiles($"*{ITEM_EXTENSION}", SearchOption.TopDirectoryOnly)
+                        .Count();
+                }
+            }
+        }
+        
+        public DirectoryQueue(string key, int timeToWait = 1000, bool lazyInitialize = true)
+        {
+            _queuePath = getQueuePath(key);
+            _timeToWait = timeToWait;
+            _lazyInitialize = lazyInitialize;
 
-            _readQueue = new Queue<DirectoryQueueItem<TObject>>();
+            _queueDirectory = new DirectoryInfo(_queuePath);
 
-            _queuePath = Path.Combine(Path.GetTempPath(), $"DQ_{QUEUE_KEY}", key);
-            _lockPath = Path.Combine(_queuePath, "queue.lock");
-
-            _directoryInfo = new DirectoryInfo(_queuePath);
-            createDirectoryIfNotExists();
-
-            _queueLock = requestAccess();
+            if (!lazyInitialize)
+            {
+                _queueDirectory.Create();
+            }
         }
 
-        public async Task EnqueueAsync(TObject data)
-        {
-            var queueItem = new DirectoryQueueItem<TObject>(data);
+        public static async Task CleanUpAsync(string key) =>
+            await Task.Run(() => Directory.Delete(getQueuePath(key), true));
 
-            await writeAsync(queueItem);
+        public async Task Enqueue(TObject data)
+        {
+            if (_lazyInitialize)
+            {
+                await initializeDirectoryAsync();
+            }
+            await writeAsync(data);
         }
 
         public async Task<TObject> DequeueAsync()
         {
-            if (!_initialized)
+            if (_lazyInitialize)
             {
-                var items = await loadBufferedItemsAsync();
-                _readQueue = new Queue<DirectoryQueueItem<TObject>>(items);
-                _initialized = true;
+                await initializeDirectoryAsync();
             }
 
-            var item = _readQueue.Dequeue();
-
-            await Task.Run(() => File.Delete(item.PathToFile(_queuePath)));
-
-            return item.Data;
+            using(lockQueue())
+            {
+                var path = await getNextFilePathAsync();
+                var data = await readAsync(path);
+                
+                await Task.Run(() => File.Delete(path));
+                
+                return data;
+            }
         }
 
-        private async Task<DirectoryQueueItem<TObject>[]> loadBufferedItemsAsync()
+        private async Task writeAsync(TObject data)
         {
-            var paths = _directoryInfo
-                .EnumerateFiles("*", SearchOption.TopDirectoryOnly)
-                .OrderByDescending(d => d.LastWriteTime)
+            var path = getRandomFilePath();
+            using(var fileStream = File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            using(var writer = new StreamWriter(fileStream))
+            {
+                var serializedData = JsonConvert.SerializeObject(data);
+                await writer.WriteAsync(serializedData);
+            }
+        }
+
+        private async Task<TObject> readAsync(string path)
+        {
+            using(var fileStream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            using(var reader = new StreamReader(fileStream))
+            {
+                var serializedData = await reader.ReadToEndAsync();
+                return JsonConvert.DeserializeObject<TObject>(serializedData);
+            }
+        }
+
+        private async Task initializeDirectoryAsync() =>
+            await Task.Run(() => _queueDirectory.Create());
+
+        private async Task<string> getNextFilePathAsync()
+        {
+            var paths = await getFilePathsAsync();
+            var path = paths.FirstOrDefault();
+            if (path == null)
+            {
+                throw new IndexOutOfRangeException("Queue is empty");
+            }
+            return path;
+        }
+
+        private async Task<List<string>> getFilePathsAsync()
+        {
+            return await Task.Run(() => _queueDirectory
+                .EnumerateFiles($"*{ITEM_EXTENSION}", SearchOption.TopDirectoryOnly)
+                .OrderBy(f => f.CreationTime)
                 .Select(f => f.FullName)
-                .ToList();
-
-            var tasks = paths.Select(readAsync).ToList();
-            return await Task.WhenAll(tasks);
+                .ToList());
         }
 
-        private void createDirectoryIfNotExists()
-        {
-            if (!_directoryInfo.Exists)
-            {
-                _directoryInfo.Create();
-            }
-        }
+        private string getRandomFilePath() =>
+            Path.Combine(_queuePath, getRandomKey() + ITEM_EXTENSION);
 
-        private async Task writeAsync(DirectoryQueueItem<TObject> data)
-        {
-            var serialized = JsonConvert.SerializeObject(data);
-            var path = data.PathToFile(_queuePath);
-            using (var fileStream = File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None))
-            using (var writer = new StreamWriter(fileStream))
-            {
-                await writer.WriteAsync(serialized);
-            }
-        }
+        private string getRandomKey() =>
+            Guid.NewGuid().ToString("N").ToUpper();
 
-        private async Task<DirectoryQueueItem<TObject>> readAsync(string path)
-        {
-            using (var fileStream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.None))
-            using (var reader = new StreamReader(fileStream))
-            {
-                var data = await reader.ReadToEndAsync();
-                return JsonConvert.DeserializeObject<DirectoryQueueItem<TObject>>(data);
-            }
-        }
+        private string getMutexKey() =>
+            _queuePath.Replace(Path.DirectorySeparatorChar, '_');
 
-        private IDisposable requestAccess()
+        private static string getQueuePath(string key) =>
+            Path.Combine(getQueueBasePath(), key);
+
+        private static string getQueueBasePath() =>
+            Path.Combine(Path.GetTempPath(), QUEUE_KEY);
+        
+        private IDisposable lockQueue()
         {
-            var requestingAccess = true;
-            var timer = new Timer(_waitTime);
+            var timer = new Timer(_timeToWait);
             timer.Elapsed += (_, __) => timer.Stop();
             timer.Start();
-
-            do
+            while(timer.Enabled)
             {
                 try
                 {
-                    return obtainLock();
+                    var path = Path.Combine(_queuePath, "queue.lock");
+                    return File.Open(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None);
                 }
-                catch (IOException) { } // Couldn't get lock on queue
-
-                if (!timer.Enabled)
-                {
-                    throw new TimeoutException("Couldn't obtain lock on queue");
-                }
-            } while (requestingAccess);
-
-            throw new InvalidOperationException();
-        }
-
-        private Stream obtainLock()
-        {
-            return File.Open(_lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        }
-
-        public void Dispose()
-        {
-            _queueLock.Dispose();
+                catch (IOException) {} // Ignore
+            }
+            throw new TimeoutException("Failed to obtain lock");
         }
     }
 }
